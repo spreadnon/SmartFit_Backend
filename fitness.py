@@ -14,6 +14,9 @@ from langchain.memory import ConversationBufferMemory, VectorStoreRetrieverMemor
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+import redis
+#保存到mysql
+from db_save import save_to_mysql, get_from_mysql
 
 # 加载环境变量（千问API Key）
 load_dotenv()  # 加载.env文件
@@ -22,6 +25,14 @@ QWEN_API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generat
 
 # 初始化 FastAPI 应用
 app = FastAPI()
+
+# 连接本地 Redis（默认无密码）
+r = redis.Redis(
+    host="localhost",
+    port=6379,
+    db=0,
+    decode_responses=True  # 自动把 bytes 转成字符串
+)
 
 # 👇 必须添加在 app = FastAPI() 之后！
 @app.get("/test")  # GET 接口，无需请求体
@@ -84,7 +95,7 @@ class UserRequest(BaseModel):
 
 # 读取本地ExerciseDB中文数据
 def load_exercise_db():
-    with open("free-exercise-db-main/dist/exercises.json", "r", encoding="utf-8") as f:
+    with open("free-exercise-db-main/dist/exercisesCN.json", "r", encoding="utf-8") as f:
         # return json.load(f)
         data = json.load(f)
         # # 验证读取成功的核心代码
@@ -212,7 +223,8 @@ def build_prompt(user_input, user_profile, exercise_db_meta):
                         "order": 1,
                         "equipment": "杠铃",
                         "difficulty": "新手",
-                        "images":[]
+                        "images":[],
+                        "instructionsCN":[]
                     }}
                 ]
             }}
@@ -284,15 +296,67 @@ async def generate_plan(request: Request):
     if not user_input : #or not user_profile
         raise HTTPException(status_code=400, detail="user_input 和 user_profile 不能为空")
 
-    #检查缓存
+    # 2.5 统一缓存查找（内存 + Redis）
+    cache_id = prompt_cache._get_prompt_hash(user_input, user_profile)
+    redis_key = f"plan_cache:{cache_id}"
+    
+    # ✅ 新增：先查数据库，如果已存在则直接返回（避免重复生成）
+    db_result = get_from_mysql(user_input)
+    if db_result:
+        print(f"📌 命中 MySQL 缓存")
+        # 同步向内存和 Redis 写入（如果需要，这里只写内存加速下次查找）
+        prompt_cache.set_cached_answer(user_input, user_profile, db_result)
+        return {
+            "code": 200,
+            "msg": "命中数据库缓存，训练计划生成成功",
+            "data": db_result
+        }
+
+
+    
+    # 首先检查内存缓存
     cached_answer = prompt_cache.get_cached_answer(user_input, user_profile)
     if cached_answer:
-        print(f"📌 命中缓存，直接返回记忆中的答案")
+        print(f"📌 命中内存缓存")
+
+        # 1. 获取数据
+        data = [
+            {"search_str": user_input,
+            "search_respond": cached_answer
+            }
+        ]
+        # 2. 调用另一个文件，保存到数据库
+        save_to_mysql(data)
+
+
         return {
             "code": 200,
             "msg": "命中缓存，训练计划生成成功",
             "data": cached_answer
         }
+    
+    # 其次检查 Redis 缓存
+    try:
+        redis_val = r.get(redis_key)
+        if redis_val:
+            print(f"📌 命中 Redis 缓存")
+            cached_answer = json.loads(redis_val)
+            # 同步回内存缓存
+            prompt_cache.set_cached_answer(user_input, user_profile, cached_answer)
+            
+            # ✅ 新增：Redis 命中也保存到数据库
+            data = [
+                {"search_str": user_input, "search_respond": cached_answer}
+            ]
+            save_to_mysql(data)
+
+            return {
+                "code": 200,
+                "msg": "命中缓存，训练计划生成成功",
+                "data": cached_answer
+            }
+    except Exception as e:
+        print(f"⚠️ Redis 读取失败: {e}")
 
     # 3. 加载ExerciseDB数据，提取元数据（供大模型参考）
     try:
@@ -344,14 +408,19 @@ async def generate_plan(request: Request):
      # ✅ 关键步骤：调用转换函数，将所有中文 key 转为英文（必须执行！）
     translated_plan_logic = translate_chinese_keys_to_english(plan_logic)
     
-    # #更新短期记忆
-    # update_short_term_memory(user_input, json.dumps(translated_plan_logic, ensure_ascii=False))
-    # # 按需更新长期记忆（当用户要求记住某些特殊的偏好时）
-    # if "记住" in user_input:
-    #     update_long_term_memory(user_input.replace("记住", "").strip())
-    
+    # 7. 写入缓存（内存 + Redis）
     prompt_cache.set_cached_answer(user_input, user_profile, translated_plan_logic)
-    print(f"📌 非缓存命中，生成答案并写入缓存")
+    try:
+        r.set(redis_key, json.dumps(translated_plan_logic, ensure_ascii=False), ex=60*60*24*7)
+        print(f"📌 非缓存命中，生成答案并写入内存和 Redis 缓存")
+        
+        # ✅ 新增：新生成的计划也保存到数据库
+        data = [
+            {"search_str": user_input, "search_respond": translated_plan_logic}
+        ]
+        save_to_mysql(data)
+    except Exception as e:
+        print(f"⚠️ Redis 或 MySQL 写入失败: {e}")
 
     # 7. 返回标准化结果
     return {
@@ -377,7 +446,8 @@ def translate_chinese_keys_to_english(data):
         "次要肌肉": "secondary_muscles",
         "动作类型": "exercise_type",
         "备注": "remark",
-        "说明": "instructions"  # 新增：匹配返回结果里的「说明」
+        "说明": "instructions",  # 新增：匹配返回结果里的「说明」
+        "说明CN": "instructionsCN"
     }
     
     # 以下递归逻辑不变
