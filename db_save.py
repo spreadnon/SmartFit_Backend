@@ -2,7 +2,7 @@
 import pymysql
 import json
 
-def save_to_mysql(user_data):
+def save_to_mysql(user_id, user_data):
     """
     接收数据，写入 MySQL。
     使用项目主数据库 'smartfit' 中的 'search_history' 表。
@@ -20,11 +20,11 @@ def save_to_mysql(user_data):
         )
         cursor = conn.cursor()
 
-        # 2. 检查表结构（如果不存在则创建，确保与 smartfit 库中一致）
-        # 注意：smartfit 库中已有该表，字段为 id, search_str, search_respond
+        # 2. 检查表结构（如果不存在则创建，增加 user_id 关联）
         create_table_sql = """
         CREATE TABLE IF NOT EXISTS search_history (
             id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT,
             search_str VARCHAR(100) NOT NULL,
             search_respond TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -32,11 +32,17 @@ def save_to_mysql(user_data):
         """
         cursor.execute(create_table_sql)
         
+        # 检查是否需要增加 user_id 字段 (针对已存在的旧表)
+        try:
+            cursor.execute("SHOW COLUMNS FROM search_history LIKE 'user_id'")
+            if not cursor.fetchone():
+                cursor.execute("ALTER TABLE search_history ADD COLUMN user_id INT AFTER id")
+        except:
+            pass
+
         # 3. 插入数据
-        # 仅插入 search_str，因为此时可能还没有 AI 响应
-        sql = "INSERT INTO search_history (search_str,search_respond) VALUES (%s,%s)"
+        sql = "INSERT INTO search_history (user_id, search_str, search_respond) VALUES (%s, %s, %s)"
         
-        # ✅ 修复：字典不能直接作为 SQL 参数，需序列化为 JSON 字符串
         data_list = []
         for d in user_data:
             search_str = d.get("search_str", "")
@@ -46,20 +52,21 @@ def save_to_mysql(user_data):
             if isinstance(search_respond, (dict, list)):
                 search_respond = json.dumps(search_respond, ensure_ascii=False)
             
-            data_list.append((search_str, search_respond))
+            data_list.append((user_id, search_str, search_respond))
         
         cursor.executemany(sql, data_list)
         conn.commit()
-        print(f"✅ 数据已保存到 smartfit 数据库的 search_history 表中！记录数: {len(data_list)}")
+        print(f"✅ 数据已关联用户 {user_id} 保存到 search_history 表中！记录数: {len(data_list)}")
 
     except Exception as e:
-        print(f"❌ 数据库保存到 smartfit 失败：{e}")
+        print(f"❌ 数据库保存失败：{e}")
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
-def get_from_mysql(search_str):
+
+def get_from_mysql(user_id, search_str):
     """
-    根据搜索关键词从 MySQL 中查找最近的响应。
+    根据用户 ID 和搜索关键词从 MySQL 中查找最近的响应。
     """
     conn = None
     cursor = None
@@ -73,9 +80,9 @@ def get_from_mysql(search_str):
         )
         cursor = conn.cursor()
         
-        # 查找最近的一条记录
-        sql = "SELECT search_respond FROM search_history WHERE search_str = %s ORDER BY created_at DESC LIMIT 1"
-        cursor.execute(sql, (search_str,))
+        # 查找该用户最近的一条记录
+        sql = "SELECT search_respond FROM search_history WHERE user_id = %s AND search_str = %s ORDER BY created_at DESC LIMIT 1"
+        cursor.execute(sql, (user_id, search_str))
         result = cursor.fetchone()
         
         if result and result[0]:

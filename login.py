@@ -139,10 +139,18 @@ class AppleLoginRequest(BaseModel):
 @app.post("/api/apple/login")
 def apple_login(req: AppleLoginRequest):
     # 1. 验证 Apple 令牌，拿到官方数据
-    print(f"id_token: {req.id_token}")
-    apple_payload = verify_apple_id_token(req.id_token)
-    apple_sub = apple_payload["sub"]
-    apple_email = apple_payload.get("email")  # 可能是隐藏邮箱
+    print(f"🚀 收到 Apple 登录请求, id_token 长度: {len(req.id_token) if req.id_token else 0}")
+    try:
+        apple_payload = verify_apple_id_token(req.id_token)
+        apple_sub = apple_payload["sub"]
+        apple_email = apple_payload.get("email")
+        print(f"✅ Apple 验证通过: sub={apple_sub}, email={apple_email}")
+    except HTTPException as e:
+        print(f"❌ Apple 验证失败: {e.detail}")
+        raise e
+    except Exception as e:
+        print(f"❌ Apple 验证出现异常: {e}")
+        raise HTTPException(status_code=401, detail=f"验证失败: {str(e)}")
 
     # 2. 根据 apple_sub 查询/创建用户（自动注册）
     user = get_user_by_apple_sub(apple_sub)
@@ -153,12 +161,14 @@ def apple_login(req: AppleLoginRequest):
             email=apple_email,
             name=req.name
         )
+        if not user_id:
+            print("❌ 数据库注册失败，无法继续")
+            raise HTTPException(status_code=500, detail="用户注册失败")
         user = {"id": user_id, "apple_sub": apple_sub}
 
-    # 3. 生成你自己业务的 Token
-    #token = create_business_token(user["id"])
-        # 生成通用Token
+    # 3. 生成通用 Token
     token = create_token(user["id"])
+    print(f"🎉 登录成功，发放 Token, user_id={user['id']}")
 
     return {
         "code": 200,
@@ -180,16 +190,26 @@ def create_business_token(user_id: int):
     )
 
 def get_user_by_apple_sub(apple_sub):
+    print(f"🔍 查询用户: apple_sub={apple_sub}")
     conn = get_db_connection()
     try:
         with conn.cursor(pymysql.cursors.DictCursor) as cursor:
             sql = "SELECT id, apple_sub, email, name FROM users WHERE apple_sub = %s"
             cursor.execute(sql, (apple_sub,))
-            return cursor.fetchone()
+            result = cursor.fetchone()
+            if result:
+                print(f"✅ 查找到用户: user_id={result['id']}")
+            else:
+                print(f"ℹ️ 未查找到用户，将进行自动注册")
+            return result
+    except Exception as e:
+        print(f"❌ 查询用户失败: {e}")
+        return None
     finally:
         conn.close()
 
 def create_user(apple_sub, email=None, name=None):
+    print(f"🆕 开始注册新用户: apple_sub={apple_sub}, email={email}, name={name}")
     conn = get_db_connection()
     try:
         with conn.cursor() as cursor:
@@ -197,6 +217,10 @@ def create_user(apple_sub, email=None, name=None):
             cursor.execute(sql, (apple_sub, email, name))
             user_id = cursor.lastrowid
         conn.commit()
+        print(f"✅ 注册成功: user_id={user_id}")
         return user_id
+    except Exception as e:
+        print(f"❌ 注册用户失败: {e}")
+        return None
     finally:
         conn.close()

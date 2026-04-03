@@ -17,6 +17,9 @@ from slowapi.errors import RateLimitExceeded
 import redis
 #保存到mysql
 from db_save import save_to_mysql, get_from_mysql
+from jwt_util import parse_token
+from fastapi import FastAPI, HTTPException, Request, Depends
+from training_log_api import router as training_router # 导入新的训练日志路由
 
 # 加载环境变量（千问API Key）
 load_dotenv()  # 加载.env文件
@@ -26,13 +29,25 @@ QWEN_API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generat
 # 初始化 FastAPI 应用
 app = FastAPI()
 
+# 挂载训练日志路由
+app.include_router(training_router)
+
 # 连接本地 Redis（默认无密码）
-r = redis.Redis(
-    host="localhost",
-    port=6379,
-    db=0,
-    decode_responses=True  # 自动把 bytes 转成字符串
-)
+try:
+    r = redis.Redis(
+        host="localhost",
+        port=6379,
+        db=0,
+        decode_responses=True,  # 自动把 bytes 转成字符串
+        socket_connect_timeout=2 # 快速失败，不卡死服务
+    )
+    # 立即测试连接，如果失败后续逻辑将跳过 Redis
+    r.ping()
+    print("✅ Redis 连接成功")
+    redis_available = True
+except Exception as e:
+    print(f"⚠️ Redis 未启动或连接失败 (将使用本地内存和数据库缓存): {e}")
+    redis_available = False
 
 # 👇 必须添加在 app = FastAPI() 之后！
 @app.get("/test")  # GET 接口，无需请求体
@@ -281,7 +296,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @limiter.limit("100/minute")  # 单IP每分钟最多100次请求
 # @limiter.global_limit("100/minute") #全局限流每分钟最多100次请求
 # 核心逻辑：生成智能训练计划
-async def generate_plan(request: Request):
+async def generate_plan(request: Request, user_id: int = Depends(parse_token)):
     # 1. 读取并解析请求体
     try:
         request_body = await request.json()  # 异步读取 JSON 请求体
@@ -300,19 +315,17 @@ async def generate_plan(request: Request):
     cache_id = prompt_cache._get_prompt_hash(user_input, user_profile)
     redis_key = f"plan_cache:{cache_id}"
     
-    # ✅ 新增：先查数据库，如果已存在则直接返回（避免重复生成）
-    db_result = get_from_mysql(user_input)
+    # ✅ 修改：关联 user_id 查询数据库
+    db_result = get_from_mysql(user_id, user_input)
     if db_result:
-        print(f"📌 命中 MySQL 缓存")
-        # 同步向内存和 Redis 写入（如果需要，这里只写内存加速下次查找）
+        print(f"📌 命中 MySQL 缓存 (用户 {user_id})")
+        # 同步向内存和 Redis 写入
         prompt_cache.set_cached_answer(user_input, user_profile, db_result)
         return {
             "code": 200,
             "msg": "命中数据库缓存，训练计划生成成功",
             "data": db_result
         }
-
-
     
     # 首先检查内存缓存
     cached_answer = prompt_cache.get_cached_answer(user_input, user_profile)
@@ -325,9 +338,8 @@ async def generate_plan(request: Request):
             "search_respond": cached_answer
             }
         ]
-        # 2. 调用另一个文件，保存到数据库
-        save_to_mysql(data)
-
+        # 2. 调用另一个文件，保存到数据库，关联 user_id
+        save_to_mysql(user_id, data)
 
         return {
             "code": 200,
@@ -336,29 +348,30 @@ async def generate_plan(request: Request):
         }
     
     # 其次检查 Redis 缓存
-    try:
-        redis_val = r.get(redis_key)
-        if redis_val:
-            print(f"📌 命中 Redis 缓存")
-            cached_answer = json.loads(redis_val)
-            # 同步回内存缓存
-            prompt_cache.set_cached_answer(user_input, user_profile, cached_answer)
-            
-            # ✅ 新增：Redis 命中也保存到数据库
-            data = [
-                {"search_str": user_input, "search_respond": cached_answer}
-            ]
-            save_to_mysql(data)
+    if redis_available:
+        try:
+            redis_val = r.get(redis_key)
+            if redis_val:
+                print(f"📌 命中 Redis 缓存")
+                cached_answer = json.loads(redis_val)
+                # 同步回内存缓存
+                prompt_cache.set_cached_answer(user_input, user_profile, cached_answer)
+                
+                # ✅ 修改：Redis 命中也关联 user_id 保存到数据库
+                data = [
+                    {"search_str": user_input, "search_respond": cached_answer}
+                ]
+                save_to_mysql(user_id, data)
+    
+                return {
+                    "code": 200,
+                    "msg": "命中缓存，训练计划生成成功",
+                    "data": cached_answer
+                }
+        except Exception as e:
+            print(f"⚠️ Redis 读取失败: {e}")
 
-            return {
-                "code": 200,
-                "msg": "命中缓存，训练计划生成成功",
-                "data": cached_answer
-            }
-    except Exception as e:
-        print(f"⚠️ Redis 读取失败: {e}")
-
-    # 3. 加载ExerciseDB数据，提取元数据（供大模型参考）
+    # 3. 加载ExerciseDB数据，提取元数据
     try:
         exercise_db = load_exercise_db()
     except Exception as e:
@@ -410,17 +423,24 @@ async def generate_plan(request: Request):
     
     # 7. 写入缓存（内存 + Redis）
     prompt_cache.set_cached_answer(user_input, user_profile, translated_plan_logic)
+    
+    # 写入 Redis
+    if redis_available:
+        try:
+            r.set(redis_key, json.dumps(translated_plan_logic, ensure_ascii=False), ex=60*60*24*7)
+            print(f"📌 非缓存命中，生成答案并写入内存和 Redis 缓存")
+        except Exception as e:
+            print(f"⚠️ Redis 写入失败: {e}")
+    
+    # 写入 MySQL
     try:
-        r.set(redis_key, json.dumps(translated_plan_logic, ensure_ascii=False), ex=60*60*24*7)
-        print(f"📌 非缓存命中，生成答案并写入内存和 Redis 缓存")
-        
-        # ✅ 新增：新生成的计划也保存到数据库
+        # ✅ 新增：新生成的计划也保存到数据库，关联 user_id
         data = [
             {"search_str": user_input, "search_respond": translated_plan_logic}
         ]
-        save_to_mysql(data)
+        save_to_mysql(user_id, data)
     except Exception as e:
-        print(f"⚠️ Redis 或 MySQL 写入失败: {e}")
+        print(f"⚠️ MySQL 写入失败: {e}")
 
     # 7. 返回标准化结果
     return {
