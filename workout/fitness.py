@@ -1,8 +1,10 @@
 import os
 import json
+import time
 from http import client
 import requests
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import numpy as np
 import hashlib
@@ -20,6 +22,7 @@ from db_save import save_to_mysql, get_from_mysql
 from jwt_util import parse_token
 from fastapi import FastAPI, HTTPException, Request, Depends
 from training_log_api import router as training_router # 导入新的训练日志路由
+from login import router as login_router # 导入登录路由
 
 # 加载环境变量（千问API Key）
 load_dotenv()  # 加载.env文件
@@ -31,6 +34,7 @@ app = FastAPI()
 
 # 挂载训练日志路由
 app.include_router(training_router)
+app.include_router(login_router)
 
 # 连接本地 Redis（默认无密码）
 try:
@@ -110,19 +114,55 @@ class UserRequest(BaseModel):
 
 # 读取本地ExerciseDB中文数据
 def load_exercise_db():
-    with open("free-exercise-db-main/dist/exercisesCN.json", "r", encoding="utf-8") as f:
-        # return json.load(f)
-        data = json.load(f)
-        # # 验证读取成功的核心代码
-        # print("✅ 文件读取成功！")
-        # print(f"数据类型：{type(data)}")  # 应该是 list/dict（JSON 文件的顶层结构）
-        # print(f"数据条数：{len(data)}")   # 如果是列表，显示元素个数；字典则显示键的数量
-        # print(f"第一条数据示例：{data[0] if isinstance(data, list) else list(data.values())[0]}")  # 打印第一条数据（按需）
-        if not data:
-            print("⚠️  文件读取成功，但内容为空！")
-        else:
-            print("✅ 文件读取成功且包含数据！")
-        return data
+    try:
+        with open("free-exercise-db-main/dist/exercisesCN.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if not data:
+                print("⚠️  文件读取成功，但内容为空！")
+            else:
+                # ✅ 统一处理图片路径：把 "/" 换成 "_"，并去掉 ".jpg" 后缀，匹配 iOS 本地资源格式
+                for exercise in data:
+                    if "images" in exercise:
+                        exercise["images"] = [
+                            img.replace("/", "_").replace(".jpg", "") 
+                            for img in exercise["images"]
+                        ]
+                print(f"✅ ExerciseDB 加载成功，并已完成图片路径预处理，共 {len(data)} 条数据")
+            return data
+    except Exception as e:
+        print(f"❌ 加载动作库失败: {e}")
+        return []
+
+# 全局变量：服务启动时加载一次
+GLOBAL_EXERCISE_DB = load_exercise_db()
+
+# 预计算元数据和动作名称映射
+def compute_global_meta(exercise_db):
+    if not exercise_db:
+        return {}, {}
+    
+    # 提取元数据（仅包含训练编排必要的辅助信息，移除图片等大字段）
+    meta = {
+        "total_exercises": len(exercise_db),
+        "available_equipment_types": [x for x in list(set([e.get("equipment", "") for e in exercise_db])) if x],
+        "difficulty_levels": [x for x in list(set([e.get("level", "") for e in exercise_db])) if x],
+        "target_muscle_groups": [x for x in list(set([",".join(e.get("primaryMuscles", [])) for e in exercise_db])) if x]
+    }
+    
+    # 动作映射：支持中英文名称，并进行归一化处理（去掉空格）以增强匹配成功率
+    mapping = {}
+    for e in exercise_db:
+        name_cn = e.get("nameCN", "")
+        name_en = e.get("name", "")
+        if name_cn:
+            mapping[name_cn.replace(" ", "")] = e
+        if name_en:
+            # 同时也支持归一化的英文名称匹配
+            mapping[name_en.replace(" ", "").lower()] = e
+            
+    return meta, mapping
+
+GLOBAL_EXERCISE_META, GLOBAL_EXERCISE_MAP = compute_global_meta(GLOBAL_EXERCISE_DB)
 
 
 # # 短期记忆：内存列表（模拟ConversationBufferMemory）
@@ -291,6 +331,35 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["100/minute"])#, 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# ====================== 新增：全局异常捕获，统一返回格式 ======================
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """
+    统一处理所有的 HTTPException，返回 {code, msg, data} 格式
+    """
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "code": exc.status_code,
+            "msg": exc.detail,
+            "data": None
+        }
+    )
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """
+    统一处理未捕获的 500 系统错误
+    """
+    return JSONResponse(
+        status_code=500,
+        content={
+            "code": 500,
+            "msg": f"服务器内部错误: {str(exc)}",
+            "data": None
+        }
+    )
+
 # 定义训练计划生成接口（POST 请求）
 @app.post("/generate-plan")
 @limiter.limit("100/minute")  # 单IP每分钟最多100次请求
@@ -298,8 +367,11 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # 核心逻辑：生成智能训练计划
 async def generate_plan(request: Request, user_id: int = Depends(parse_token)):
     # 1. 读取并解析请求体
+    start_total = time.perf_counter()
     try:
+        t0 = time.perf_counter()
         request_body = await request.json()  # 异步读取 JSON 请求体
+        print(f"⏱️  解析请求体耗时: {time.perf_counter() - t0:.4f}s")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"请求体解析失败：{str(e)}")
     
@@ -312,13 +384,14 @@ async def generate_plan(request: Request, user_id: int = Depends(parse_token)):
         raise HTTPException(status_code=400, detail="user_input 和 user_profile 不能为空")
 
     # 2.5 统一缓存查找（内存 + Redis）
+    t_cache = time.perf_counter()
     cache_id = prompt_cache._get_prompt_hash(user_input, user_profile)
     redis_key = f"plan_cache:{cache_id}"
     
     # ✅ 修改：关联 user_id 查询数据库
     db_result = get_from_mysql(user_id, user_input)
     if db_result:
-        print(f"📌 命中 MySQL 缓存 (用户 {user_id})")
+        print(f"📌 命中 MySQL 缓存 (用户 {user_id}), 耗时: {time.perf_counter() - t_cache:.4f}s")
         # 同步向内存和 Redis 写入
         prompt_cache.set_cached_answer(user_input, user_profile, db_result)
         return {
@@ -371,50 +444,65 @@ async def generate_plan(request: Request, user_id: int = Depends(parse_token)):
         except Exception as e:
             print(f"⚠️ Redis 读取失败: {e}")
 
-    # 3. 加载ExerciseDB数据，提取元数据
-    try:
-        exercise_db = load_exercise_db()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"加载动作库失败：{str(e)}")
-    
-    # ✅ 核心修复：替换为 JSON 真实的英文键名 + 增加容错处理
-    exercise_db_meta = {
-        #动作总数
-        "total_exercises": len(exercise_db),
-        # 器械类型 → equipment，用 get 容错，过滤空值
-        "available_equipment_types": [x for x in list(set([e.get("equipment", "") for e in exercise_db])) if x],
-        # 难度等级 → level，用 get 容错，过滤空值
-        "difficulty_levels": [x for x in list(set([e.get("level", "") for e in exercise_db])) if x],
-        # 目标肌肉 → primaryMuscles（数组），拼接成字符串后去重
-        "target_muscle_groups": [x for x in list(set([",".join(e.get("primaryMuscles", [])) for e in exercise_db])) if x],
-        "exercises_images": [x for x in list(set([",".join(e.get("images", [])) for e in exercise_db])) if x],
-        
-    }
+    # 3. 使用全局元数据构建提示词
+    t_meta = time.perf_counter()
+    print(f"⏱️  获取全局元数据耗时: {time.perf_counter() - t_meta:.4f}s (预加载已优化)")
     
     # 4. 构建提示词
     try:
-        prompt = build_prompt(user_input, user_profile, exercise_db_meta)
+        t_prompt = time.perf_counter()
+        prompt = build_prompt(user_input, user_profile, GLOBAL_EXERCISE_META)
+        print(f"⏱️  构建提示词耗时: {time.perf_counter() - t_prompt:.4f}s")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"构建提示词失败：{str(e)}")
     
     # 5. 调用千问大模型获取编排逻辑
     try:
+        t_qwen = time.perf_counter()
         plan_logic = call_qwen(prompt)
+        print(f"⏱️  调用大模型耗时: {time.perf_counter() - t_qwen:.4f}s")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"调用大模型失败：{str(e)}")
     
-    # 6. 结合ExerciseDB补充动作详情（如次要肌肉、动作类型）
-    # ✅ 修复：构建动作映射时用 nameCN（中文名称）匹配，补充真实字段
-    exercise_map = {e.get("nameCN", ""): e for e in exercise_db}
+    # 6. 结合ExerciseDB补充动作详情（兼容中英文 Key）
     try:
-        for day_plan in plan_logic.get("每日计划", []):# 每日计划 → daily_plans
-            for action in day_plan.get("动作列表", []): # 动作列表 → exercise_list
-                action_name = action.get("动作名称", "") #动作名称 → exercise_name
-                action_detail = exercise_map.get(action_name)
+        t_post = time.perf_counter()
+        # 兼容性查找：尝试获取每日计划列表
+        daily_plans = plan_logic.get("daily_plans") or plan_logic.get("每日计划") or []
+        
+        for day_plan in daily_plans:
+            # 兼容性查找：尝试获取动作列表
+            exercise_list = day_plan.get("exercise_list") or day_plan.get("动作列表") or []
+            
+            for action in exercise_list:
+                # 1. 归一化精准匹配（去掉空格）
+                raw_name = action.get("exercise_name") or action.get("动作名称") or ""
+                normalized_name = raw_name.replace(" ", "").lower()
+                action_detail = GLOBAL_EXERCISE_MAP.get(normalized_name)
+                
+                # 2. 如果精准匹配失败，尝试关键词保底搜索（例如“自重深蹲” -> 包含“深蹲”）
+                if not action_detail and len(normalized_name) >= 2:
+                    for k, v in GLOBAL_EXERCISE_MAP.items():
+                        if normalized_name in k or k in normalized_name:
+                            action_detail = v
+                            break
+                
+                # 确保基础结构存在，防止 iOS 端解析失败
+                action.setdefault("images", [])
+                action.setdefault("primary_muscles", [])
+                action.setdefault("instructionsCN", [])
+                action.setdefault("secondary_muscles", [])
+                action.setdefault("exercise_type", "")
+                
                 if action_detail:
-                    # 次要肌肉 → secondaryMuscles，动作类型 → category
-                    action["次要肌肉"] = action_detail.get("secondaryMuscles", [])# 次要肌肉 → secondary_muscles
-                    action["动作类型"] = action_detail.get("category", "")# 动作类型 → exercise_type
+                    # 强力补全 ID、图片、肌肉等本地核心数据
+                    action["id"] = action_detail.get("id", "")
+                    action["images"] = action_detail.get("images", [])
+                    action["instructionsCN"] = action_detail.get("instructionsCN", [])
+                    action["secondary_muscles"] = action_detail.get("secondaryMuscles", [])
+                    action["exercise_type"] = action_detail.get("category", "")
+                    action["primary_muscles"] = action_detail.get("primaryMuscles", [])
+        print(f"⏱️  后期补充详情耗时: {time.perf_counter() - t_post:.4f}s")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"补充动作详情失败：{str(e)}")
     
@@ -442,12 +530,38 @@ async def generate_plan(request: Request, user_id: int = Depends(parse_token)):
     except Exception as e:
         print(f"⚠️ MySQL 写入失败: {e}")
 
-    # 7. 返回标准化结果
-    return {
+    # 7. 返回标准化结果前，强制进行图片路径归一化（确保即使是缓存旧数据也能被修复）
+    normalized_data = recursive_normalize_images(translated_plan_logic)
+    
+    final_response = {
         "code": 200,
         "msg": "训练计划生成成功",
-        "data": translated_plan_logic
+        "data": normalized_data
     }
+    print(f"📤 接口返回数据: {json.dumps(final_response, ensure_ascii=False, indent=2)}")
+    print(f"✅ 总处理耗时: {time.perf_counter() - start_total:.4f}s")
+    return final_response
+
+
+def recursive_normalize_images(data):
+    """
+    递归遍历字典/列表，将所有 'images' 字段中的 '/' 替换为 '_' 并去掉 '.jpg'
+    """
+    if isinstance(data, dict):
+        new_dict = {}
+        for k, v in data.items():
+            if k == "images" and isinstance(v, list):
+                new_dict[k] = [
+                    (img.replace("/", "_").replace(".jpg", "") if isinstance(img, str) else img)
+                    for img in v
+                ]
+            else:
+                new_dict[k] = recursive_normalize_images(v)
+        return new_dict
+    elif isinstance(data, list):
+        return [recursive_normalize_images(i) for i in data]
+    else:
+        return data
 
 
 def translate_chinese_keys_to_english(data):
@@ -467,7 +581,9 @@ def translate_chinese_keys_to_english(data):
         "动作类型": "exercise_type",
         "备注": "remark",
         "说明": "instructions",  # 新增：匹配返回结果里的「说明」
-        "说明CN": "instructionsCN"
+        "说明CN": "instructionsCN",
+        "primaryMuscles": "primary_muscles", # 新增：转换主肌键名
+        "id": "id"
     }
     
     # 以下递归逻辑不变

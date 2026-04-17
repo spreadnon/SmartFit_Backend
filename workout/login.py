@@ -11,9 +11,11 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 from jwt_util import create_token
+from fastapi import FastAPI, HTTPException, Request, APIRouter
 
 load_dotenv()
 app = FastAPI(title="Apple 登录")
+router = APIRouter(prefix="/api/apple", tags=["Login"])
 
 # ==================== CORS 配置 ====================
 app.add_middleware(
@@ -136,7 +138,7 @@ class AppleLoginRequest(BaseModel):
     name: str = None    # 首次授权才有
 
 # ==================== Apple 登录核心接口 ====================
-@app.post("/api/apple/login")
+@router.post("/login")
 def apple_login(req: AppleLoginRequest):
     # 1. 验证 Apple 令牌，拿到官方数据
     print(f"🚀 收到 Apple 登录请求, id_token 长度: {len(req.id_token) if req.id_token else 0}")
