@@ -66,6 +66,27 @@ class MySQLClient:
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
                 """
                 cursor.execute(create_users_table)
+
+                # 创建训练日志表
+                create_training_table = """
+                CREATE TABLE IF NOT EXISTS training (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user_id INT NOT NULL,
+                    external_id VARCHAR(50),
+                    exercise_name VARCHAR(255) NOT NULL,
+                    sets INT NOT NULL,
+                    reps VARCHAR(50) NOT NULL,
+                    weight DECIMAL(10, 2),
+                    extra_data JSON,
+                    duration INT DEFAULT 0,
+                    focus_area VARCHAR(100),
+                    log_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_external_id (external_id),
+                    INDEX idx_user_date (user_id, log_date),
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+                cursor.execute(create_training_table)
                 
                 conn.commit()
                 print("✅ 数据库环境初始化成功")
@@ -147,6 +168,106 @@ class MySQLClient:
         except Exception as e:
             print(f"❌ 注册用户失败: {e}")
             return None
+        finally:
+            conn.close()
+
+    def save_training_record(self, user_id: int, training_data: dict) -> bool:
+        """保存单条训练记录（UPSERT：先按 external_id 查，再按当天同名动作查）"""
+        conn = self._get_connection()
+        try:
+            external_id   = training_data.get("external_id")
+            exercise_name = training_data.get("exercise_name")
+            sets          = training_data.get("sets")
+            reps          = training_data.get("reps")
+            duration      = training_data.get("duration", 0)
+            focus_area    = training_data.get("focus_area")
+            extra_data    = training_data.get("exercise_sets")
+            weight        = training_data.get("weight")
+
+            if isinstance(extra_data, (list, dict)):
+                extra_data = json.dumps(extra_data, ensure_ascii=False)
+
+            if weight is not None:
+                try:
+                    weight = float(weight)
+                except (ValueError, TypeError):
+                    weight = None
+
+            with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+                existing = None
+
+                # 1. 按 external_id 查
+                if external_id:
+                    cursor.execute(
+                        "SELECT id FROM training WHERE external_id = %s LIMIT 1",
+                        (external_id,)
+                    )
+                    existing = cursor.fetchone()
+
+                # 2. 按当天同名动作查
+                if not existing:
+                    cursor.execute(
+                        """SELECT id FROM training
+                           WHERE user_id = %s AND exercise_name = %s
+                             AND DATE(log_date) = CURDATE()
+                           LIMIT 1""",
+                        (user_id, exercise_name)
+                    )
+                    existing = cursor.fetchone()
+
+                if existing:
+                    cursor.execute(
+                        """UPDATE training
+                           SET exercise_name = %s, sets = %s, reps = %s, weight = %s,
+                               extra_data = %s, duration = %s, focus_area = %s, log_date = NOW()
+                           WHERE id = %s""",
+                        (exercise_name, sets, reps, weight,
+                         extra_data, duration, focus_area, existing["id"])
+                    )
+                else:
+                    cursor.execute(
+                        """INSERT INTO training
+                               (user_id, external_id, exercise_name, sets, reps,
+                                weight, extra_data, duration, focus_area, log_date)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+                        (user_id, external_id, exercise_name, sets, reps,
+                         weight, extra_data, duration, focus_area)
+                    )
+
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"❌ 保存用户 {user_id} 训练数据失败: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def fetch_training_records_by_date(self, user_id: int, date_str: str) -> List[Dict[str, Any]]:
+        """查询指定日期的训练记录"""
+        conn = self._get_connection()
+        try:
+            with conn.cursor(pymysql.cursors.DictCursor) as cursor:
+                cursor.execute(
+                    """SELECT id, external_id, exercise_name, sets, reps, weight,
+                              extra_data, duration, focus_area, log_date
+                       FROM training
+                       WHERE user_id = %s AND DATE(log_date) = %s
+                       ORDER BY log_date ASC""",
+                    (user_id, date_str)
+                )
+                results = cursor.fetchall()
+                for row in results:
+                    if row.get("log_date"):
+                        row["log_date"] = row["log_date"].strftime("%Y-%m-%d %H:%M:%S")
+                    if row.get("extra_data") and isinstance(row["extra_data"], str):
+                        try:
+                            row["extra_data"] = json.loads(row["extra_data"])
+                        except Exception:
+                            pass
+                return results
+        except Exception as e:
+            print(f"❌ 查询用户 {user_id} 在 {date_str} 的训练数据失败: {e}")
+            return []
         finally:
             conn.close()
 
