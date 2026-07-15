@@ -2,11 +2,14 @@
 from fastapi import APIRouter, Request, Depends, HTTPException
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from core.dependencies import get_plan_cache, get_plan_service, parse_token
-from config.settings import settings
-from utils.json_util import UserRequest
+from fitness_project.core.dependencies import (
+    get_plan_cache,
+    get_plan_service,
+    parse_token,
+)
+from fitness_project.config.settings import settings
 
-router = APIRouter(prefix="/plan", tags=["训练计划"])
+router = APIRouter(prefix="/api/plans", tags=["训练计划"])
 limiter = Limiter(key_func=get_remote_address)
 
 @router.post("/generate")

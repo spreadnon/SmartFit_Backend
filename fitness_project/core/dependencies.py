@@ -1,8 +1,7 @@
 # core/dependencies.py
-from fastapi import Depends
-from cache.impl import PlanCache
-from services.plan_service import PlanGenerationService
-from jwt_util import parse_token
+from fitness_project.cache.impl import PlanCache
+from fitness_project.services.plan_service import PlanGenerationService
+from fitness_project.core.security import parse_token
 
 # 单例模式提供缓存实例
 _plan_cache = None
@@ -20,10 +19,6 @@ def get_plan_service():
         _plan_service = PlanGenerationService()
     return _plan_service
 
-# 假的 token 解析（先让项目跑起来）
-def parse_token():
-    return 10086
-    
 # 导出依赖
 dependencies = {
     "parse_token": parse_token,
