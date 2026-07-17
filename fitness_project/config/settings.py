@@ -37,7 +37,7 @@ class Settings(BaseSettings):
         "smartfit_default_secret_key_change_in_production",
     )
     JWT_EXPIRE_DAYS: int = int(os.getenv("JWT_EXPIRE_DAYS", "7"))
-    APPLE_CLIENT_ID: str = os.getenv("APPLE_CLIENT_ID", "")
+    APPLE_CLIENT_ID: str = os.getenv("APPLE_CLIENT_ID", "com.SmartFitness")
     # 动作库路径
     EXERCISE_DB_PATH: Path = Path("free-exercise-db-main/dist/exercisesCN.json")
 

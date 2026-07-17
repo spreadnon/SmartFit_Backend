@@ -8,6 +8,7 @@ from fitness_project.core.dependencies import (
     parse_token,
 )
 from fitness_project.config.settings import settings
+from fitness_project.services.plan_service import normalize_plan
 
 router = APIRouter(prefix="/api/plans", tags=["训练计划"])
 limiter = Limiter(key_func=get_remote_address)
@@ -35,7 +36,7 @@ async def generate_plan(
             return {
                 "code": 200,
                 "msg": "命中缓存，训练计划生成成功",
-                "data": cached_plan
+                "data": normalize_plan(cached_plan),
             }
         
         # 3. 生成计划
