@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
         logger.exception("数据库初始化失败")
     yield
 
-
+# 测试gitlens
 # 初始化 FastAPI
 app = FastAPI(title="SmartFit API", version="1.1.0", lifespan=lifespan)
 
